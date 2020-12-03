@@ -11,15 +11,24 @@ from scipy import stats
 from scipy.interpolate import RegularGridInterpolator
 import scipy.ndimage
 from scipy.linalg import cho_factor, cho_solve
-
-import emcee
-import celerite
-import radvel
+from scipy.stats import kstest
 
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
 from matplotlib.ticker import FuncFormatter, MaxNLocator
+import seaborn as sns
 import corner
+
+import astropy
+from astropy import stats as astrostats
+from astropy.timeseries import LombScargle
+
+import emcee
+#import celerite
+import radvel
+
+import rvsearch
 
 class Completeness(object):
     """Object to handle a suite of injection/recovery tests
@@ -90,7 +99,7 @@ class Completeness(object):
             assert self.grid is not None, "Must run Completeness.completeness_grid()."
             zi = self.grid[2].T
             self.interpolator = RegularGridInterpolator((self.grid[0], self.grid[1]), zi,
-                                                        bounds_error=False, fill_value=0.001)
+                                                        bounds_error=False, fill_value=0.001) # Maybe don't set fill
 
         return self.interpolator(np.array([np.atleast_1d(x), np.atleast_1d(y)]).T)
 
@@ -104,8 +113,9 @@ class Hierarchy(object):
     def __init__(self, pop, completeness, res=4, bins=np.array([[[np.log(0.02), np.log(20)],
                                                                  [np.log(2.), np.log(6000)]]]),
                                                                   chainname='occur_chains.csv'):
-        self.pop          = pop
-        self.completeness = completeness # Completeness grid, defined as class object above.
+        # TO-DO: Replace single-param planets with paths to posteriors.
+        self.pop          = pop # Replace pairs of m & a with chains
+        self.completeness = completeness # Completeness grid, defined as class object below.
         self.completeness.completeness_grid([0.01, 40], [3, 7000])
         # Fill in completeness nans.
         self.completeness.grid[2][np.isnan(self.completeness.grid[2])] = 1. #0.99
@@ -118,8 +128,6 @@ class Hierarchy(object):
         self.lnm_edges = np.unique(self.bins[:, 1])
         self.nabins = len(self.lna_edges) - 1
         self.nmbins = len(self.lnm_edges) - 1
-        #self.na = len(self.lna_edges)
-        #self.nm = len(self.lnm_edges)
 
         # Compute bin centers and widths.
         self.bin_widths  = np.diff(self.bins)
@@ -165,11 +173,10 @@ class Hierarchy(object):
             planets = self.pop_med.query('axis >= @a1 and axis < @a2 and \
                                          msini >= @M1 and msini < @M2')
             nplanets = len(planets)
-            #ml  = np.log(nplanets/self.Qints[n])
             ml  = nplanets/self.Qints[n]
             uml = ml/np.sqrt(nplanets)
             if not np.isfinite(ml):
-                ml = 0.01 #-7
+                ml = 0.01
             if not np.isfinite(uml):
                 uml = 1.
             mlvalues = np.append(mlvalues, np.array([[ml, uml]]), axis=0)
@@ -189,27 +196,19 @@ class Hierarchy(object):
         ia[ia > self.nabins - 1] = self.nabins - 1
         im[im > self.nmbins - 1] = self.nmbins - 1
 
-        # Logarithmic
-        #occur = np.exp(theta[ia + im*self.nabins])
-        # Linear
         occur = theta[ia + im*self.nabins]
         # Return filler value for samples outside of the bin limits.
-        occur[iao < 0] = 0.01 #-10
-        occur[imo < 0] = 0.01 #-10
-        occur[iao > self.nabins - 1] = 0.01 #-10
-        occur[imo > self.nmbins - 1] = 0.01 #-10
+        occur[iao < 0] = 0.01
+        occur[imo < 0] = 0.01
+        occur[iao > self.nabins - 1] = 0.01
+        occur[imo > self.nmbins - 1] = 0.01
         return occur
 
     def lnlike(self, theta):
-        # Linear
-        if np.any((theta <= 0) + (theta > 2*self.ceiling)):
+        if np.any((theta <= 0) + (theta > 4*self.ceiling)):
             return -np.inf
-        # Logarithmic
-        #if np.any((theta <= -11) + (theta > self.ceiling + 1)):
-        #    return -np.inf
         sums = []
         for planet in self.planetnames:
-            #print(planet)
             probs = []
             sample_a = np.array(self.pop[planet[:-2] + '_a' + planet[-1]])
             sample_M = np.array(self.pop[planet[:-2] + '_M' + planet[-1]])
@@ -233,67 +232,14 @@ class Hierarchy(object):
             return -np.inf
         return ll
 
-    def gpprior(self, theta, mu, l0, la, lm):
-        ### Prior on occurrence. Gaussian process, for smoothly changing bin heights.
-        # Logarithmic
-        #if not -15 < mu < 15:
-        #    return -np.inf
-        # Linear
-        if not 0 < mu < 2*self.ceiling:
-            return -np.inf
-        if not -2 < l0 < 6:
-            return -np.inf
-        if not -2 < la < 1:
-            return -np.inf
-        if not -2 < lm < 0:
-            return -np.inf
-        # Linear
-        if np.any((theta <= 0) + (theta > 2*self.ceiling)):
-            return -np.inf
-        # Logarithmic
-        #if np.any((theta <= -11) + (theta > self.ceiling + 1)):
-        #    return -np.inf
-
-        # Compute Euclidean distance between bins, [∆i − ∆j]T Σ−1[∆i − ∆j]
-        mini_inv_covar = np.array([[np.exp(la)**-1, 0], [0, np.exp(lm)**-1]])
-        X              = np.matmul(self.bin_centers, mini_inv_covar)
-        distance       = scipy.spatial.distance.cdist(X, X, 'sqeuclidean')
-
-        K        = np.exp(l0)*np.exp(-0.5*distance)
-        s, logdK = np.linalg.slogdet(K)
-
-        y  = theta - mu
-        F  = cho_factor(K)
-        lp = -0.5*(logdK + np.dot(y, cho_solve(F, y)))
-
-        if not np.isfinite(lp):
-            return -np.inf
-        return lp
-
     def lnpost(self, theta):
         return self.lnlike(theta)
-
-    def gppost(self, theta_gp):
-        return self.lnlike(theta_gp[:-4]) + self.gpprior(theta_gp[:-4],
-                                                         theta_gp[-4],
-                                                         theta_gp[-3],
-                                                         theta_gp[-2],
-                                                         theta_gp[-1])
 
     def sample(self, gp=False, parallel=False, save=True):
         nwalkers = 4*self.nbins
         ndim = self.nbins
-        pos = np.array([np.abs(self.mlvalues[:, 0] + 0.01*np.random.randn(ndim)) \
-                                                 for i in np.arange(nwalkers)]) + 0.01
-        if gp:
-            ndim += 4
-            mu0 = np.mean(self.mlvalues[:, 0])
-            l00 = 0
-            la0 = 0
-            lm0 = 0
-            pos = np.append(pos, np.array([mu0, l00, la0, lm0]) + \
-                                 np.array([0.05*np.random.randn(4) \
-                                 for i in np.arange(nwalkers)]), axis=1)
+        pos = np.array([np.abs(self.mlvalues[:, 0] + 0.001*np.random.randn(ndim)) \
+                                                 for i in np.arange(nwalkers)]) + 0.0001
 
         if parallel:
             with Pool(8) as pool:
@@ -304,10 +250,7 @@ class Hierarchy(object):
                 self.sampler.run_mcmc(pos, 1000, progress=True)
                 self.chains = self.sampler.chain[:, 100:, :].reshape((-1, ndim))
         else:
-            if gp:
-                self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.gppost)
-            else:
-                self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.lnpost)
+            self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.lnpost)
             self.sampler.run_mcmc(pos, 1000, progress=True)
             self.chains = self.sampler.chain[:, 100:, :].reshape((-1, ndim))
 
@@ -315,13 +258,26 @@ class Hierarchy(object):
             chaindb = pd.DataFrame()
             for n, binn in enumerate(self.bins):
                 chaindb['gamma{}'.format(n)] = self.chains[:, n]
-            if gp:
-                chaindb['lmu)'] = self.chains[:, -4]
-                chaindb['ll0)'] = self.chains[:, -3]
-                chaindb['lla)'] = self.chains[:, -2]
-                chaindb['llm)'] = self.chains[:, -1]
             chaindb.to_csv(self.chainname)
 
     def run(self):
         self.max_like()
         self.sample()
+
+
+def lngrid(min_a, max_a, min_M, max_M, resa, resm):
+    lna1 = np.log(min_a)
+    lna2 = np.log(max_a)
+    lnM1 = np.log(min_M)
+    lnM2 = np.log(max_M)
+
+    dlna = (lna2 - lna1)/resa
+    dlnM = (lnM2 - lnM1)/resm
+
+    bins = []
+    for i in np.arange(int(resa)):
+        for j in np.arange(int(resm)):
+            bins.append([[lna1 + i*dlna, lna1 + (i+1)*dlna],
+                         [lnM1 + j*dlnM, lnM1 + (j+1)*dlnM]])
+
+    return np.array(bins)
