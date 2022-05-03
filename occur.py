@@ -112,16 +112,18 @@ class Hierarchy(object):
     """
     def __init__(self, pop, completeness, res=4, bins=np.array([[[np.log(0.02), np.log(20)],
                                                                  [np.log(2.), np.log(6000)]]]),
+                                                                  nstars=None, mass_lim=[3, 7000],
+                                                                  fraction=False, lenrun=1000,
                                                                   chainname='occur_chains.csv'):
         # TO-DO: Replace single-param planets with paths to posteriors.
         self.pop          = pop # Replace pairs of m & a with chains
         self.completeness = completeness # Completeness grid, defined as class object below.
-        self.completeness.completeness_grid([0.01, 40], [3, 7000])
+        self.completeness.completeness_grid([0.01, 40], mass_lim)
         # Fill in completeness nans.
         self.completeness.grid[2][np.isnan(self.completeness.grid[2])] = 1. #0.99
 
 
-        self.res = res # Resolution for logarithmic completeness integration.
+        self.res = int(round(res)) # Resolution for logarithmic completeness integration.
         self.bins = bins # Logarithmic bins in msini/axis space.
         self.nbins = len(self.bins)
         self.lna_edges = np.unique(self.bins[:, 0])
@@ -137,10 +139,10 @@ class Hierarchy(object):
         # Pre-compute integrated completeness for each bin.
         self.Qints = np.zeros(self.nbins)
         for n, binn in enumerate(self.bins):
-            for i in np.arange(4): #self.res
-                for j in np.arange(4):
-                    lna_av = binn[0][0] + (0.25*i + 0.125)*(binn[0][1] - binn[0][0])
-                    lnm_av = binn[1][0] + (0.25*j + 0.125)*(binn[1][1] - binn[1][0])
+            for i in np.arange(self.res):
+                for j in np.arange(self.res):
+                    lna_av = binn[0][0] + (i/self.res + 1/(2*self.res))*(binn[0][1] - binn[0][0])
+                    lnm_av = binn[1][0] + (j/self.res + 1/(2*self.res))*(binn[1][1] - binn[1][0])
                     self.Qints[n] += (self.bin_areas[n][0]/self.res**2) * \
                                       self.completeness.interpolate(np.exp(lna_av),
                                                                     np.exp(lnm_av))
@@ -151,7 +153,11 @@ class Hierarchy(object):
         self.starnames   = np.unique([x[:-1] for x in self.planetnames])
         self.nplanets    = len(self.planetnames)
         self.nsamples    = len(self.pop)
-        self.nstars      = len(self.starnames)
+
+        if nstars is not None:
+            self.nstars = nstars
+        else:
+            self.nstars = len(self.starnames)
 
         medians = pop.median() # Along chain axis, once using chains.
         for name in self.planetnames:
@@ -159,6 +165,8 @@ class Hierarchy(object):
             msini.append(medians[[name[:-1] + 'M' + name[-1]]][0])
         self.pop_med = pd.DataFrame.from_dict({'axis':axis, 'msini':msini})
 
+        self.fraction  = fraction
+        self.lenrun    = lenrun
         self.chainname = chainname
 
     def max_like(self):
@@ -205,7 +213,11 @@ class Hierarchy(object):
         return occur
 
     def lnlike(self, theta):
-        if np.any((theta <= 0) + (theta > 4*self.ceiling)):
+        # Implement probability hard-bound prior.
+        if self.fraction:
+            if np.sum(theta * self.bin_areas)/self.nstars > 1:
+                return -np.inf
+        if np.any((theta <= 0) + (theta > 10*self.ceiling)):
             return -np.inf
         sums = []
         for planet in self.planetnames:
@@ -214,6 +226,7 @@ class Hierarchy(object):
             sample_M = np.array(self.pop[planet[:-2] + '_M' + planet[-1]])
             probs = self.completeness.interpolate(sample_a, sample_M)*self.occurrence(
                                            np.log(sample_a), np.log(sample_M), theta)
+            #print(planet, probs)
             sums.append(np.sum(probs))
 
         # Integrate the observed occurrence over all bins.
@@ -247,11 +260,11 @@ class Hierarchy(object):
                     self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.gppost, pool=pool)
                 else:
                     self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.lnpost, pool=pool)
-                self.sampler.run_mcmc(pos, 1000, progress=True)
+                self.sampler.run_mcmc(pos, self.lenrun, progress=True)
                 self.chains = self.sampler.chain[:, 100:, :].reshape((-1, ndim))
         else:
             self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.lnpost)
-            self.sampler.run_mcmc(pos, 1000, progress=True)
+            self.sampler.run_mcmc(pos, self.lenrun, progress=True)
             self.chains = self.sampler.chain[:, 100:, :].reshape((-1, ndim))
 
         if save:
@@ -281,3 +294,129 @@ def lngrid(min_a, max_a, min_M, max_M, resa, resm):
                          [lnM1 + j*dlnM, lnM1 + (j+1)*dlnM]])
 
     return np.array(bins)
+
+
+class PowerLaw(object):
+    """Do hierarchical Bayesian sampling of occurrence posteriors, based on DFM et al. 2014.
+    Args:
+        pop (pandas DataFrame): dataframe of planet parameter chains
+
+    """
+    def __init__(self, pop, completeness, lna_res=5, lnm_res=10, edges=np.array([[0.03, 1], [2, 30]]),
+                 chainname='powerlaw_chains.csv'):
+        # TO-DO: Replace single-param planets with paths to posteriors.
+        self.pop          = pop
+        self.completeness = completeness
+        self.completeness.completeness_grid([0.01, 40], [2, 7000]) # or just edges?
+        # Fill in completeness nans.
+        self.completeness.grid[2][np.isnan(self.completeness.grid[2])] = 1.
+
+        axis  = []
+        msini = []
+        self.planetnames = np.unique([x[:-2] + x[-1] for x in pop.columns])
+        self.starnames   = np.unique([x[:-1] for x in self.planetnames])
+        self.nplanets    = len(self.planetnames)
+        self.nsamples    = len(self.pop)
+        self.nstars      = len(self.starnames)
+
+        medians = pop.median()
+        for name in self.planetnames:
+            axis.append(medians[[name[:-1] + 'a' + name[-1]]][0])
+            msini.append(medians[[name[:-1] + 'M' + name[-1]]][0])
+        self.pop_med = pd.DataFrame.from_dict({'axis':axis, 'msini':msini})
+
+        self.chainname = chainname
+
+        # Pre-compute integrated completeness over lnm_res-many bins.
+        self.lna_res = int(lna_res)
+        self.lnm_res = int(lnm_res)
+        self.edges = edges
+        self.Qints = np.zeros(self.lnm_res)
+        self.lnawidth = (np.log(self.edges[0][1]) - np.log(self.edges[0][0]))/self.lna_res
+        self.lnmwidth = (np.log(self.edges[1][1]) - np.log(self.edges[1][0]))/self.lnm_res
+
+        self.lna_centers = np.zeros(self.lna_res)
+        self.lnm_centers = np.zeros(self.lnm_res)
+        for i in np.arange(self.lna_res):
+            self.lna_centers[i] = np.log(self.edges[0][0]) + (i + 0.5)*self.lnawidth
+        for j in np.arange(self.lnm_res):
+            self.lnm_centers[j] = np.log(self.edges[1][0]) + (j + 0.5)*self.lnmwidth
+
+        for i in np.arange(self.lna_res):
+            for j in np.arange(self.lnm_res):
+                self.Qints[i] += (self.lnawidth*self.lnmwidth) * \
+                                  self.completeness.interpolate(np.exp(self.lna_centers[i]),
+                                                                np.exp(self.lnm_centers[j]))
+        self.Qints /= (np.log(self.edges[1][1]) - np.log(self.edges[1][0])) # Necessary? Maybe can streamline DaDm.
+
+    def max_like(self):
+        # FIGURE THIS OUT? OR LEAVE AS DECENT GUESS.
+        C = 5
+        M = -1
+        self.mlvalues = np.array([C, M])
+
+    def occurrence(self, mass, theta):
+        power = np.atleast_1d(theta[0]*mass**theta[1])
+        power[mass < self.edges[1][0]] = 0.01
+        power[mass >= self.edges[1][1]] = 0.01
+        return power
+        #lognorm = np.atleast_1d(theta[0]*np.exp((np.log(mass) - theta[1])**2/(2*theta[2]**2)))
+        #lognorm[mass < self.edges[1][0]] = 0.01
+        #lognorm[mass >= self.edges[1][1]] = 0.01
+        #return lognorm
+
+    def lnlike(self, theta):
+        sums = []
+        for planet in self.planetnames:
+            probs = []
+            sample_a = np.array(self.pop[planet[:-2] + '_a' + planet[-1]])
+            sample_M = np.array(self.pop[planet[:-2] + '_M' + planet[-1]])
+            probs = self.completeness.interpolate(sample_a, sample_M) * \
+                                  self.occurrence(sample_M, theta)
+            sums.append(np.sum(probs))
+
+        nexpect = 0
+        for i in np.arange(self.lna_res):
+            nexpect += self.Qints[i]*self.occurrence(np.exp(self.lnm_centers[i]), theta)
+
+        ll = -nexpect + np.sum(np.log(np.array(sums)/self.nsamples))
+        if not np.isfinite(ll):
+            return -np.inf
+        return ll
+
+    def lnprior(self, theta):
+        if theta[0] <= 0 or theta[0] > 10 or theta[1] <= -5 or theta[1] > 5:
+            return -np.inf
+        return 0
+
+    def lnpost(self, theta):
+        return self.lnlike(theta) + self.lnprior(theta)
+
+    def sample(self, parallel=False, save=True, nsamples=1000):
+        nwalkers = 30
+        ndim  = len(self.mlvalues)
+        nburn = 100
+        if nsamples <= nburn:
+            nburn = int(np.round(0.1*nsamples))
+        pos = np.array([np.abs(self.mlvalues + 0.01*np.random.randn(ndim)) \
+                                           for i in np.arange(nwalkers)])
+        if parallel:
+            with Pool(8) as pool:
+                self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.lnpost, pool=pool)
+                self.sampler.run_mcmc(pos, nsamples, progress=True)
+                self.chains = self.sampler.chain[:, nburn:, :].reshape((-1, ndim))
+        else:
+            self.sampler = emcee.EnsembleSampler(nwalkers, ndim, self.lnpost)
+            self.sampler.run_mcmc(pos, nsamples, progress=True)
+            self.chains = self.sampler.chain[:, nburn:, :].reshape((-1, ndim))
+
+        if save:
+            chaindb = pd.DataFrame()
+            chaindb['C'] = self.chains[:, 0]
+            chaindb['M'] = self.chains[:, 1]
+            #chaindb['sig'] = self.chains[:, 2]
+            chaindb.to_csv(self.chainname)
+
+    def run(self):
+        self.max_like()
+        self.sample()
